@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.wrangler/
+
+# Secrets — NEVER commit these
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+pids/
+*.pid
+*.seed
+
+# PM2
+.pm2/
+
+# Backups
+*.tar.gz
+*.zip
+*.bak
+*.backup
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local scratch
+scratch/
+tmp/

@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "nectary",
+  "compatibility_date": "2025-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "pages_build_output_dir": "./dist",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "nectary-production",
+      "database_id": "REPLACE_WITH_WRANGLER_D1_CREATE_ID"
+    }
+  ],
+  "vars": {
+    "LEDGER_MODE": "live",
+    "DEFAULT_SCAN_CREDITS": "5",
+    "DEFAULT_CONTACT_CREDITS": "2"
+  }
+}
