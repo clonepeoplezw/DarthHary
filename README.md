@@ -114,6 +114,7 @@ npx wrangler pages secret put GEMINI_API_KEY
 # Local development (.dev.vars, gitignored)
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash
+GEMINI_THINKING_BUDGET=0     # see note below
 ICYPEAS_API_KEY=      # optional: leave blank for demo mode
 PROSPEO_API_KEY=      # optional
 HUNTER_API_KEY=       # optional
@@ -121,6 +122,23 @@ HUNTER_API_KEY=       # optional
 
 Get a Gemini key at https://aistudio.google.com/apikey — the free tier is enough
 to validate ICP quality before spending anything on enrichment.
+
+**Gemini is the primary provider.** `llmConfigured()` checks `GEMINI_API_KEY`
+first, so once that key is set the OpenAI fallback is ignored entirely. You do
+not need to change code to switch — just add the key.
+
+### Why `GEMINI_THINKING_BUDGET=0`
+
+Gemini 2.5+ Flash models think by default, and thinking tokens are billed
+against `maxOutputTokens`. With a structured-output call capped at ~1600 tokens,
+the thinking pass can consume the whole budget and return `finishReason:
+MAX_TOKENS` with **empty text**. For schema-constrained extraction there is
+nothing to reason about, so thinking is disabled by default.
+
+The client also retries once with a doubled token budget on `MAX_TOKENS` before
+failing, so a large page degrades into a slower success rather than an error.
+
+Set `GEMINI_THINKING_BUDGET=-1` to re-enable dynamic thinking if you want it.
 
 ### Enrichment providers
 

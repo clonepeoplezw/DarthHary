@@ -5,6 +5,7 @@ export interface Env {
   // exercised locally/in tests without a Gemini key. Both are server-side only.
   GEMINI_API_KEY?: string
   GEMINI_MODEL?: string
+  GEMINI_THINKING_BUDGET?: string
   LLM_BASE_URL?: string
   LLM_API_KEY?: string
   LLM_MODEL?: string

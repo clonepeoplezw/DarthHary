@@ -132,59 +132,121 @@ ${body}
 
 const GEMINI_TIMEOUT_MS = 45_000
 
+/**
+ * Gemini 2.5+ Flash models "think" by default, and thinking tokens are charged
+ * against maxOutputTokens. With a structured-output call capped at ~1600 tokens
+ * the thinking pass can consume the entire budget, yielding finishReason
+ * MAX_TOKENS and EMPTY text. For schema-constrained extraction there is nothing
+ * to reason about, so we disable it. Override with GEMINI_THINKING_BUDGET if you
+ * ever want it back (e.g. "-1" for dynamic thinking).
+ */
+function thinkingConfig(env: Env, model: string): Record<string, unknown> | null {
+  // thinkingConfig is only understood by 2.5+ models; older ones reject it.
+  if (!/^gemini-(2\.5|3|4)/i.test(model)) return null
+  const raw = (env.GEMINI_THINKING_BUDGET ?? '').trim()
+  const budget = raw === '' ? 0 : Number(raw)
+  if (!Number.isFinite(budget)) return { thinkingBudget: 0 }
+  return { thinkingBudget: budget }
+}
+
 async function callGemini(env: Env, opts: LlmOptions): Promise<any> {
   const model = env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`
 
-  const body = {
-    systemInstruction: { parts: [{ text: opts.system + schemaContract(opts.schema) }] },
-    contents: [{ role: 'user', parts: [{ text: opts.user }] }],
-    generationConfig: {
+  const baseBudget = opts.maxOutputTokens ?? 4096
+  const think = thinkingConfig(env, model)
+
+  // Two attempts: if the first is truncated by the output cap, retry once with
+  // a larger budget rather than failing the user's scan.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const budget = attempt === 0 ? baseBudget : Math.min(baseBudget * 2, 8192)
+
+    const generationConfig: Record<string, unknown> = {
       temperature: opts.temperature ?? 0.2,
-      maxOutputTokens: opts.maxOutputTokens ?? 4096,
+      maxOutputTokens: budget,
       responseMimeType: 'application/json',
       responseSchema: opts.schema,
-    },
-    // Keeping the safety block at defaults; this is B2B content, not anything exotic.
+    }
+    if (think) generationConfig.thinkingConfig = think
+
+    const body = {
+      systemInstruction: { parts: [{ text: opts.system + schemaContract(opts.schema) }] },
+      contents: [{ role: 'user', parts: [{ text: opts.user }] }],
+      generationConfig,
+    }
+
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': env.GEMINI_API_KEY as string,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
+      })
+    } catch (e: any) {
+      throw new LlmError('gemini_unreachable', `Could not reach the model provider (${e?.name || 'network'}).`, true)
+    }
+
+    if (res.status === 429) {
+      throw new LlmError('rate_limited', 'The model provider is rate limiting us. Try again shortly.', true)
+    }
+    if (res.status === 401 || res.status === 403) {
+      throw new LlmError('bad_key', 'The Gemini API key was rejected. Check the secret on the server.', false)
+    }
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => '')).slice(0, 300)
+      // Gemini reports an invalid key as 400, not 401. Match on the message so
+      // the user sees "key rejected" instead of a generic provider error.
+      if (/API key not valid|API_KEY_INVALID|invalid api key/i.test(detail)) {
+        throw new LlmError('bad_key', 'The Gemini API key was rejected. Check the secret on the server.', false)
+      }
+      if (/responseSchema|response_schema|INVALID_ARGUMENT/i.test(detail)) {
+        throw new LlmError(
+          'bad_schema',
+          `Gemini rejected the response schema for ${model}. Try a different GEMINI_MODEL. ${detail}`,
+          false,
+        )
+      }
+      throw new LlmError('gemini_error', `Model provider error ${res.status}. ${detail}`, res.status >= 500)
+    }
+
+    const data: any = await res.json()
+    const candidate = data?.candidates?.[0]
+    const finish = candidate?.finishReason
+
+    if (finish === 'SAFETY' || finish === 'BLOCKED' || finish === 'PROHIBITED_CONTENT') {
+      throw new LlmError('blocked', 'The model refused to answer for this page.', false)
+    }
+    if (finish === 'RECITATION') {
+      throw new LlmError('blocked', 'The model declined to quote this page.', false)
+    }
+
+    const text = (candidate?.content?.parts || [])
+      .map((p: any) => p?.text || '')
+      .join('')
+      .trim()
+
+    if (finish === 'MAX_TOKENS') {
+      // First attempt: retry with a doubled budget. Second: give an accurate error.
+      if (attempt === 0) {
+        console.log(`[llm] MAX_TOKENS with budget ${budget} on ${model}, retrying larger`)
+        continue
+      }
+      throw new LlmError(
+        'truncated',
+        'The model ran out of output tokens. This page was unusually large — try again, or raise the token budget.',
+        true,
+      )
+    }
+
+    if (!text) throw new LlmError('empty', 'The model returned an empty response.', true)
+    return parseJsonLoose(text)
   }
 
-  let res: Response
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-goog-api-key': env.GEMINI_API_KEY as string,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(GEMINI_TIMEOUT_MS),
-    })
-  } catch (e: any) {
-    throw new LlmError('gemini_unreachable', `Could not reach the model provider (${e?.name || 'network'}).`, true)
-  }
-
-  if (res.status === 429) throw new LlmError('rate_limited', 'The model provider is rate limiting us. Try again shortly.', true)
-  if (res.status === 401 || res.status === 403) {
-    throw new LlmError('bad_key', 'The Gemini API key was rejected. Check the secret on the server.', false)
-  }
-  if (!res.ok) {
-    const detail = (await res.text().catch(() => '')).slice(0, 300)
-    throw new LlmError('gemini_error', `Model provider error ${res.status}. ${detail}`, res.status >= 500)
-  }
-
-  const data: any = await res.json()
-  const candidate = data?.candidates?.[0]
-  const finish = candidate?.finishReason
-  if (finish === 'SAFETY' || finish === 'BLOCKED') {
-    throw new LlmError('blocked', 'The model refused to answer for this page.', false)
-  }
-  const text = (candidate?.content?.parts || [])
-    .map((p: any) => p?.text || '')
-    .join('')
-    .trim()
-
-  if (!text) throw new LlmError('empty', 'The model returned an empty response.', true)
-  return parseJsonLoose(text)
+  throw new LlmError('truncated', 'The model could not finish within the token budget.', true)
 }
 
 async function callOpenAiCompatible(env: Env, opts: LlmOptions): Promise<any> {
