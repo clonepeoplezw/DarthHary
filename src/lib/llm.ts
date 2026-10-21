@@ -39,17 +39,43 @@ export const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash'
  * a secret, so it is safe to surface on /api/status — it lets you confirm that
  * a GEMINI_MODEL change took effect without reading CI logs.
  */
+/**
+ * Google AI Studio keys are `AIza` + 35 chars = 39 characters. We do NOT use
+ * this to authenticate (the API is the only authority on that), it is only a
+ * cheap sanity check so that a truncated paste — which would otherwise be
+ * selected as the provider and 400 on every single request — is ignored and
+ * the working fallback is used instead.
+ */
+function geminiKeyLooksPlausible(key: string | undefined): boolean {
+  const k = (key ?? '').trim()
+  return /^AIza[0-9A-Za-z_-]{30,}$/.test(k)
+}
+
 export function llmConfigured(env: Env): {
   ok: boolean
   provider: 'gemini' | 'openai' | 'none'
   model: string | null
+  /** Set when a configured key was rejected *locally* (e.g. malformed paste). */
+  note?: string
 } {
-  if (env.GEMINI_API_KEY && env.GEMINI_API_KEY.length > 10) {
+  const geminiKey = (env.GEMINI_API_KEY ?? '').trim()
+  const geminiOk = geminiKeyLooksPlausible(geminiKey)
+  const openaiOk = !!(env.LLM_API_KEY && env.LLM_BASE_URL)
+
+  // A malformed key must not shadow a working provider. Report why, so the
+  // problem is visible on /api/status rather than as every request failing.
+  const shapeNote =
+    geminiKey && !geminiOk
+      ? `GEMINI_API_KEY looks malformed (length ${geminiKey.length}, expected 39 starting with "AIza") — ignoring it.`
+      : undefined
+
+  if (geminiOk) {
     return { ok: true, provider: 'gemini', model: env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL }
   }
-  if (env.LLM_API_KEY && env.LLM_BASE_URL) {
-    return { ok: true, provider: 'openai', model: env.LLM_MODEL?.trim() || null }
+  if (openaiOk) {
+    return { ok: true, provider: 'openai', model: env.LLM_MODEL?.trim() || null, ...(shapeNote ? { note: shapeNote } : {}) }
   }
+  if (shapeNote) return { ok: false, provider: 'none', model: null, note: shapeNote }
   return { ok: false, provider: 'none', model: null }
 }
 

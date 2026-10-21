@@ -43,7 +43,14 @@ app.get('/api/status', async (c) => {
   const llm = llmConfigured(c.env)
   const user = await getSessionUser(c as Ctx)
   return c.json({
-    ai: { configured: llm.ok, provider: llm.provider, model: llm.model },
+    ai: {
+      configured: llm.ok,
+      provider: llm.provider,
+      model: llm.model,
+      // Local sanity-check only (e.g. a truncated key paste); the provider API
+      // remains the authority on whether a key actually works.
+      ...(llm.note ? { note: llm.note } : {}),
+    },
     enrichment: { configured: enrichmentConfigured(c.env) },
     authenticated: !!user,
   })
