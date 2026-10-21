@@ -4,6 +4,18 @@ import { readCookie, SESSION_COOKIE } from './auth'
 
 export type Ctx = Context<{ Bindings: Env; Variables: { user: User } }>
 
+/**
+ * Routes that are not yet behind requireAuth (signup, login) have no `user`
+ * variable in their context, so they cannot be typed as `Ctx`.
+ *
+ * Note on variance: `Context<{Bindings}>` is NOT a supertype of
+ * `Context<{Bindings, Variables}>` because `set` is contravariant in the
+ * variable map. So a structural widening is needed rather than a narrower
+ * generic. `Context<any>` is that widening: it accepts every Hono context in
+ * this app, and these helpers only ever touch request/response primitives.
+ */
+export type AnyCtx = Context<any>
+
 export interface ApiError {
   error: string
   message: string
@@ -11,24 +23,26 @@ export interface ApiError {
   details?: unknown
 }
 
-export function fail(c: Ctx, status: number, code: string, message: string, details?: unknown) {
+export function fail(c: AnyCtx, status: number, code: string, message: string, details?: unknown) {
   const payload: ApiError = { error: code, message, ...(details ? { details } : {}) }
   return c.json(payload, status as any)
 }
 
 /** Resolve the signed-in user from the session cookie. */
-export async function getSessionUser(c: Ctx): Promise<User | null> {
+export async function getSessionUser(c: AnyCtx): Promise<User | null> {
   const sid = readCookie(c.req.header('cookie'), SESSION_COOKIE)
   if (!sid) return null
 
   const now = Math.floor(Date.now() / 1000)
-  const row = await c.env.DB.prepare(
+  // `c` is Context<any>, so c.env is `any` — calling .first<User>() on an `any`
+  // expression is an error (TS2347). Re-typing the env here restores the
+  // generic: it is the only thing in this helper that needs the binding types.
+  const env = c.env as Env
+  const row = await env.DB.prepare(
     `SELECT u.id, u.email, u.plan, u.credits, u.is_admin
        FROM sessions s JOIN users u ON u.id = s.user_id
       WHERE s.id = ? AND s.expires_at > ?`,
-  )
-    .bind(sid, now)
-    .first<User>()
+  ).bind(sid, now).first<User>()
 
   return row ?? null
 }
@@ -58,7 +72,7 @@ export function rateLimit(key: string, limit: number, windowMs: number): boolean
   return true
 }
 
-export function clientIp(c: Ctx): string {
+export function clientIp(c: AnyCtx): string {
   return c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for')?.split(',')[0]?.trim() || 'unknown'
 }
 

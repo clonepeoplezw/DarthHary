@@ -32,10 +32,25 @@ export interface LlmOptions {
   seed?: number
 }
 
-export function llmConfigured(env: Env): { ok: boolean; provider: 'gemini' | 'openai' | 'none' } {
-  if (env.GEMINI_API_KEY && env.GEMINI_API_KEY.length > 10) return { ok: true, provider: 'gemini' }
-  if (env.LLM_API_KEY && env.LLM_BASE_URL) return { ok: true, provider: 'openai' }
-  return { ok: false, provider: 'none' }
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.6-flash'
+
+/**
+ * Which provider and model a request will actually use. The model name is not
+ * a secret, so it is safe to surface on /api/status — it lets you confirm that
+ * a GEMINI_MODEL change took effect without reading CI logs.
+ */
+export function llmConfigured(env: Env): {
+  ok: boolean
+  provider: 'gemini' | 'openai' | 'none'
+  model: string | null
+} {
+  if (env.GEMINI_API_KEY && env.GEMINI_API_KEY.length > 10) {
+    return { ok: true, provider: 'gemini', model: env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL }
+  }
+  if (env.LLM_API_KEY && env.LLM_BASE_URL) {
+    return { ok: true, provider: 'openai', model: env.LLM_MODEL?.trim() || null }
+  }
+  return { ok: false, provider: 'none', model: null }
 }
 
 function stripFences(text: string): string {
@@ -133,32 +148,59 @@ ${body}
 const GEMINI_TIMEOUT_MS = 45_000
 
 /**
- * Gemini 2.5+ Flash models "think" by default, and thinking tokens are charged
- * against maxOutputTokens. With a structured-output call capped at ~1600 tokens
- * the thinking pass can consume the entire budget, yielding finishReason
- * MAX_TOKENS and EMPTY text. For schema-constrained extraction there is nothing
- * to reason about, so we disable it. Override with GEMINI_THINKING_BUDGET if you
- * ever want it back (e.g. "-1" for dynamic thinking).
+ * Thinking configuration differs by model family — this is not cosmetic:
+ *
+ *   Gemini 2.5.x  -> generationConfig.thinkingConfig.thinkingBudget
+ *                    (0 fully disables thinking)
+ *   Gemini 3.x/4.x -> generationConfig.thinkingConfig.thinkingLevel
+ *                    ("minimal" | "low" | "medium" | "high")
+ *
+ * Sending thinkingBudget to a 3.x model is rejected by the API, and sending
+ * thinkingLevel to a 2.5 model is likewise rejected. Gemini 3.x also CANNOT
+ * fully disable thinking — "minimal" is the floor and "does not guarantee
+ * thinking is off". That matters because thinking tokens are billed against
+ * maxOutputTokens and can starve a structured-output response into
+ * finishReason MAX_TOKENS with empty text.
+ *
+ * Default is "minimal": this is schema-constrained extraction, not reasoning.
  */
-function thinkingConfig(env: Env, model: string): Record<string, unknown> | null {
-  // thinkingConfig is only understood by 2.5+ models; older ones reject it.
-  if (!/^gemini-(2\.5|3|4)/i.test(model)) return null
-  const raw = (env.GEMINI_THINKING_BUDGET ?? '').trim()
-  const budget = raw === '' ? 0 : Number(raw)
-  if (!Number.isFinite(budget)) return { thinkingBudget: 0 }
-  return { thinkingBudget: budget }
+function thinkingConfig(env: Env, model: string): { fields: Record<string, unknown>; canDisable: boolean } | null {
+  const isV3Plus = /^gemini-(3|4)/i.test(model)
+  const isV25 = /^gemini-2\.5/i.test(model)
+
+  if (isV3Plus) {
+    const raw = (env.GEMINI_THINKING_LEVEL ?? '').trim().toLowerCase()
+    const allowed = ['minimal', 'low', 'medium', 'high']
+    const level = allowed.includes(raw) ? raw : 'minimal'
+    return { fields: { thinkingLevel: level }, canDisable: false }
+  }
+
+  if (isV25) {
+    const raw = (env.GEMINI_THINKING_BUDGET ?? '').trim()
+    const budget = raw === '' ? 0 : Number(raw)
+    return { fields: { thinkingBudget: Number.isFinite(budget) ? budget : 0 }, canDisable: true }
+  }
+
+  return null
 }
 
 async function callGemini(env: Env, opts: LlmOptions): Promise<any> {
-  const model = env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
+  const model = env.GEMINI_MODEL?.trim() || DEFAULT_GEMINI_MODEL
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`
 
-  const baseBudget = opts.maxOutputTokens ?? 4096
   const think = thinkingConfig(env, model)
 
-  // Two attempts: if the first is truncated by the output cap, retry once with
-  // a larger budget rather than failing the user's scan.
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // When thinking cannot be disabled (Gemini 3.x), reserve headroom for the
+  // thought tokens that share the maxOutputTokens budget.
+  const requested = opts.maxOutputTokens ?? 4096
+  const baseBudget = think && !think.canDisable ? Math.min(requested * 2, 8192) : requested
+
+  // Thinking controls are model-family specific and a wrong one is a hard 400.
+  // Downgrade gracefully instead of failing the user's scan.
+  let levelFallback: string | null = null
+  let dropThinking = false
+
+  for (let attempt = 0; attempt < 3; attempt++) {
     const budget = attempt === 0 ? baseBudget : Math.min(baseBudget * 2, 8192)
 
     const generationConfig: Record<string, unknown> = {
@@ -167,7 +209,10 @@ async function callGemini(env: Env, opts: LlmOptions): Promise<any> {
       responseMimeType: 'application/json',
       responseSchema: opts.schema,
     }
-    if (think) generationConfig.thinkingConfig = think
+
+    if (think && !dropThinking) {
+      generationConfig.thinkingConfig = levelFallback ? { thinkingLevel: levelFallback } : think.fields
+    }
 
     const body = {
       systemInstruction: { parts: [{ text: opts.system + schemaContract(opts.schema) }] },
@@ -197,16 +242,38 @@ async function callGemini(env: Env, opts: LlmOptions): Promise<any> {
       throw new LlmError('bad_key', 'The Gemini API key was rejected. Check the secret on the server.', false)
     }
     if (!res.ok) {
-      const detail = (await res.text().catch(() => '')).slice(0, 300)
-      // Gemini reports an invalid key as 400, not 401. Match on the message so
-      // the user sees "key rejected" instead of a generic provider error.
+      const detail = (await res.text().catch(() => '')).slice(0, 400)
+
+      // Gemini reports an invalid key as 400, not 401.
       if (/API key not valid|API_KEY_INVALID|invalid api key/i.test(detail)) {
         throw new LlmError('bad_key', 'The Gemini API key was rejected. Check the secret on the server.', false)
       }
-      if (/responseSchema|response_schema|INVALID_ARGUMENT/i.test(detail)) {
+
+      // Unsupported thinking level: step down and retry instead of failing.
+      if (/thinkingLevel|thinking_level/i.test(detail) && !levelFallback && think && !think.canDisable) {
+        levelFallback = 'low'
+        console.log(`[llm] ${model} rejected thinkingLevel, retrying with "low"`)
+        continue
+      }
+
+      // Older/newer models may reject thinkingConfig entirely — drop it and retry.
+      if (/thinkingConfig|thinking_config/i.test(detail) && attempt === 0) {
+        console.log(`[llm] ${model} rejected thinkingConfig, retrying without it`)
+        dropThinking = true
+        continue
+      }
+
+      if (/responseSchema|response_schema/i.test(detail)) {
         throw new LlmError(
           'bad_schema',
           `Gemini rejected the response schema for ${model}. Try a different GEMINI_MODEL. ${detail}`,
+          false,
+        )
+      }
+      if (/not found|is not supported|does not exist/i.test(detail) && /model/i.test(detail)) {
+        throw new LlmError(
+          'bad_model',
+          `The model "${model}" is not available on this API key. Check GEMINI_MODEL — known good: gemini-3.6-flash, gemini-2.5-flash. ${detail}`,
           false,
         )
       }
@@ -224,20 +291,23 @@ async function callGemini(env: Env, opts: LlmOptions): Promise<any> {
       throw new LlmError('blocked', 'The model declined to quote this page.', false)
     }
 
-    const text = (candidate?.content?.parts || [])
-      .map((p: any) => p?.text || '')
+    // Gemini 3.x may include thought parts in the response. Never treat those
+    // as the answer — they are reasoning, not JSON.
+    const parts: any[] = candidate?.content?.parts || []
+    const text = parts
+      .filter((p) => p && !p.thought)
+      .map((p) => p?.text || '')
       .join('')
       .trim()
 
     if (finish === 'MAX_TOKENS') {
-      // First attempt: retry with a doubled budget. Second: give an accurate error.
-      if (attempt === 0) {
+      if (attempt < 2) {
         console.log(`[llm] MAX_TOKENS with budget ${budget} on ${model}, retrying larger`)
         continue
       }
       throw new LlmError(
         'truncated',
-        'The model ran out of output tokens. This page was unusually large — try again, or raise the token budget.',
+        'The model ran out of output tokens. Try again, or raise GEMINI_THINKING_LEVEL budget.',
         true,
       )
     }

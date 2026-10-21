@@ -6,6 +6,7 @@ export interface Env {
   GEMINI_API_KEY?: string
   GEMINI_MODEL?: string
   GEMINI_THINKING_BUDGET?: string
+  GEMINI_THINKING_LEVEL?: string
   LLM_BASE_URL?: string
   LLM_API_KEY?: string
   LLM_MODEL?: string

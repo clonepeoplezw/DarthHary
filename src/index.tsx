@@ -43,7 +43,7 @@ app.get('/api/status', async (c) => {
   const llm = llmConfigured(c.env)
   const user = await getSessionUser(c as Ctx)
   return c.json({
-    ai: { configured: llm.ok, provider: llm.provider },
+    ai: { configured: llm.ok, provider: llm.provider, model: llm.model },
     enrichment: { configured: enrichmentConfigured(c.env) },
     authenticated: !!user,
   })

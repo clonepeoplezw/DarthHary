@@ -113,8 +113,9 @@ npx wrangler pages secret put GEMINI_API_KEY
 
 # Local development (.dev.vars, gitignored)
 GEMINI_API_KEY=
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_THINKING_BUDGET=0     # see note below
+GEMINI_MODEL=gemini-3.6-flash
+GEMINI_THINKING_LEVEL=minimal   # Gemini 3.x / 4.x only — see note below
+# GEMINI_THINKING_BUDGET=0      # Gemini 2.5.x only — see note below
 ICYPEAS_API_KEY=      # optional: leave blank for demo mode
 PROSPEO_API_KEY=      # optional
 HUNTER_API_KEY=       # optional
@@ -127,18 +128,29 @@ to validate ICP quality before spending anything on enrichment.
 first, so once that key is set the OpenAI fallback is ignored entirely. You do
 not need to change code to switch — just add the key.
 
-### Why `GEMINI_THINKING_BUDGET=0`
+### Thinking controls are model-family specific
 
-Gemini 2.5+ Flash models think by default, and thinking tokens are billed
-against `maxOutputTokens`. With a structured-output call capped at ~1600 tokens,
-the thinking pass can consume the whole budget and return `finishReason:
-MAX_TOKENS` with **empty text**. For schema-constrained extraction there is
-nothing to reason about, so thinking is disabled by default.
+The default model is **`gemini-3.6-flash`**. Thinking configuration changed
+between Gemini families, and sending the wrong knob is a **hard 400**, so the
+client picks the right one from the model name:
 
-The client also retries once with a doubled token budget on `MAX_TOKENS` before
-failing, so a large page degrades into a slower success rather than an error.
+| Model family | Parameter | Disable entirely? |
+|---|---|---|
+| Gemini 3.x / 4.x | `thinkingConfig.thinkingLevel` = `minimal` \| `low` \| `medium` \| `high` | ❌ No — `minimal` is the floor |
+| Gemini 2.5.x | `thinkingConfig.thinkingBudget` (int; `0` = off, `-1` = dynamic) | ✅ Yes |
 
-Set `GEMINI_THINKING_BUDGET=-1` to re-enable dynamic thinking if you want it.
+`GEMINI_THINKING_LEVEL` defaults to `minimal`; `GEMINI_THINKING_BUDGET` defaults
+to `0`. The variable belonging to the *other* family is ignored safely.
+
+**Why this matters:** thinking tokens are billed against `maxOutputTokens`. A
+structured-output call capped at ~1600 tokens can have its whole budget eaten by
+the thinking pass, returning `finishReason: MAX_TOKENS` with **empty text**.
+Because Gemini 3.x cannot switch thinking off, the client instead double-reserves
+output headroom (up to 8k) whenever thinking is non-disableable, retries once on
+`MAX_TOKENS`, and downgrades gracefully (`high`→`minimal`, then drops the
+thinking block) rather than failing the user's scan.
+
+Set `GEMINI_THINKING_BUDGET=-1` on a 2.5 model to re-enable dynamic thinking.
 
 ### Enrichment providers
 

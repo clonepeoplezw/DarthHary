@@ -20,6 +20,18 @@ function fromHex(hex: string): Uint8Array {
   return out
 }
 
+/**
+ * WebCrypto's BufferSource requires an ArrayBuffer-backed view. TypeScript's
+ * default Uint8Array generic is ArrayBufferLike (which includes SharedArrayBuffer),
+ * so it is not directly assignable. Copying into a fresh Uint8Array guarantees a
+ * plain ArrayBuffer and satisfies the type without a cast.
+ */
+function toBufferSource(bytes: Uint8Array): Uint8Array<ArrayBuffer> {
+  const copy = new Uint8Array(new ArrayBuffer(bytes.byteLength))
+  copy.set(bytes)
+  return copy
+}
+
 export function randomId(prefix = ''): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16))
   const id = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -31,9 +43,9 @@ export function randomSalt(): string {
 }
 
 export async function hashPassword(password: string, saltHex: string): Promise<string> {
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits'])
+  const key = await crypto.subtle.importKey('raw', toBufferSource(enc.encode(password)), 'PBKDF2', false, ['deriveBits'])
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt: fromHex(saltHex), iterations: ITERATIONS, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt: toBufferSource(fromHex(saltHex)), iterations: ITERATIONS, hash: 'SHA-256' },
     key,
     KEY_LEN * 8,
   )
